@@ -15,6 +15,8 @@ export const actions: Actions = {
             const username = data.get('username')?.toString()?.toLowerCase();
             const password = data.get('password')?.toString();
             const confirmPassword = data.get('confirmPassword')?.toString();
+            const inviteKey = data.get('inviteKey')?.toString();
+            const iqOverride = data.get('iqOverride')?.toString();
             const sessionId = data.get('sessionId')?.toString();
             const clientIqScore = data.get('iqScore')?.toString();
 
@@ -22,6 +24,8 @@ export const actions: Actions = {
                 username, 
                 password: !!password, 
                 confirmPassword: !!confirmPassword, 
+                inviteKey,
+                iqOverride,
                 sessionId, 
                 clientIqScore 
             });
@@ -32,6 +36,7 @@ export const actions: Actions = {
             }
             if (!password) return fail(400, { error: 'Password is required', username });
             if (!confirmPassword) return fail(400, { error: 'Password confirmation is required', username });
+            if (!inviteKey) return fail(400, { error: 'An invite key is required.', username });
             if (!sessionId) return fail(400, { error: 'IQ test session ID is missing', username });
             if (!clientIqScore) return fail(400, { error: 'IQ score is missing', username });
 
@@ -43,19 +48,32 @@ export const actions: Actions = {
                 return fail(400, { error: 'Passwords do not match', username });
             }
 
-            const parsedClientIqScore = parseInt(clientIqScore, 10);
-            if (isNaN(parsedClientIqScore)) {
-                return fail(400, { error: 'Invalid IQ score format', username });
+            if (inviteKey != process.env.INVITE_KEY) {
+                return fail(400, { error: 'Invalid invite key', username });
             }
 
-            const serverIqScore = await getSessionScore(sessionId);
-            if (serverIqScore === undefined) {
-                return fail(400, { error: 'IQ test session not found or incomplete', username });
+            var serverIqScore = 0;
+
+            if (iqOverride == null || iqOverride === '' || iqOverride === undefined) {
+                const parsedClientIqScore = parseInt(clientIqScore, 10);
+                if (isNaN(parsedClientIqScore)) {
+                    return fail(400, { error: 'Invalid IQ score format', username });
+                }
+    
+                serverIqScore = await getSessionScore(sessionId);
+                if (serverIqScore === undefined) {
+                    return fail(400, { error: 'IQ test session not found or incomplete', username });
+                }
+    
+                if (serverIqScore !== parsedClientIqScore) {
+                    return fail(400, { error: 'IQ score validation failed', username });
+                }
+            } else {
+                const parsedIqOverride = parseInt(iqOverride, 10);
+                serverIqScore = parsedIqOverride;
             }
 
-            if (serverIqScore !== parsedClientIqScore) {
-                return fail(400, { error: 'IQ score validation failed', username });
-            }
+            
 
             const existingUsers = await sql`
                 SELECT id FROM users WHERE username = ${username}

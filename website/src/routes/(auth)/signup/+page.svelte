@@ -32,6 +32,7 @@
 	let username = $state(initialUsername);
 	let password = $state('');
 	let confirmPassword = $state('');
+	let inviteKey = $state('');
 	let isSubmitting = $state(false);
 	let clientError = $state('');
 	let showTest = $state(false);
@@ -90,7 +91,7 @@
 
 	function validateForm() {
 		clientError = '';
-		if (!username || !password || !confirmPassword) {
+		if (!username || !password || !confirmPassword || !inviteKey) {
 			return false;
 		}
 		if (usernameError) {
@@ -176,6 +177,7 @@
 		if (
 			username &&
 			password &&
+			inviteKey &&
 			confirmPassword &&
 			password === confirmPassword &&
 			password.length >= 8
@@ -327,6 +329,19 @@
 									name="confirmPassword"
 									type="password"
 									bind:value={confirmPassword}
+									required
+									minlength={8}
+									disabled={isSubmitting}
+									onblur={() => checkFormAndStartTest()}
+								/>
+							</div>
+							<div class="grid gap-2">
+								<Label for="inviteKey">Invite Key</Label>
+								<Input
+									id="inviteKey"
+									name="inviteKey"
+									type="password"
+									bind:value={inviteKey}
 									required
 									minlength={8}
 									disabled={isSubmitting}
