@@ -8,8 +8,12 @@
 	import { ScrollArea } from '$lib/components/ui/scroll-area';
 	import { Input } from '$lib/components/ui/input';
 	import { Button } from '$lib/components/ui/button';
-	import { Send, Hammer } from 'lucide-svelte';
+	import { Send, Hammer, PauseCircle, PlayCircle } from 'lucide-svelte';
 	import { activeUsers } from '$lib/stores/users';
+
+	function sanitizeMessage(text: string): string {
+		return text.normalize('NFC').replace(/\p{M}+/gu, '');
+	}
 
 	let { data } = $props();
 	let isAdmin = $state(data.isAdmin || false);
@@ -32,11 +36,25 @@
 	let initialScrollDone = $state(false);
 	let shakeScreen = $state(false);
 	let isBanned = $state($USER_DATA?.is_banned || false);
+	let isPaused = $state(false);
+	let queuedMessages = $state<ChatMessage[]>([]);
+
+	let userMentionString = $derived($USER_DATA?.username ? `@${$USER_DATA.username}` : null);
+
+	function checkUserMention(text: string, mention: string | null): boolean {
+		if (!mention) return false;
+
+		const escapedMention = mention.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+		const regex = new RegExp(`${escapedMention}\\b`);
+		return regex.test(text);
+	}
 
 	const debouncedCheckVocabulary = debounce(async () => {
 		const userIQ = $USER_DATA?.iq ?? 100;
 		if (messageInput) {
-			const { isValid, limit } = checkVocabulary(messageInput, userIQ);
+			// const { isValid, limit } = checkVocabulary(messageInput, userIQ);
+			const { isValid, limit } = { isValid: true, limit: null };
 			if (!isValid) {
 				vocabularyError = `Word length exceeds limit (${limit}) for IQ ${userIQ}.`;
 			} else {
@@ -46,6 +64,17 @@
 			vocabularyError = '';
 		}
 	}, 300);
+
+	function isScrolledToBottom(): boolean {
+		if (!messagesContainer) return true;
+		const threshold = 20;
+		return (
+			messagesContainer.scrollHeight -
+				messagesContainer.scrollTop -
+				messagesContainer.clientHeight <
+			threshold
+		);
+	}
 
 	function scrollToBottom() {
 		setTimeout(() => {
@@ -58,7 +87,8 @@
 	function setupSocket() {
 		socket = io(PUBLIC_WEBSOCKET_URL, {
 			path: '/ws/socket.io',
-			auth: { token: data.token }
+			auth: { token: data.token },
+			transports: ['websocket']
 		});
 
 		socket.on('connect', () => {
@@ -74,13 +104,23 @@
 		});
 
 		socket.on('recent_messages', (recentMessages: ChatMessage[]) => {
-			messages = recentMessages;
+			messages = recentMessages.map((m) => ({
+				...m,
+				text: sanitizeMessage(m.text)
+			}));
 			scrollToBottom();
 		});
 
 		socket.on('message', (message: ChatMessage) => {
-			messages = [...messages.slice(-199), message];
-			scrollToBottom();
+			const clean = sanitizeMessage(message.text);
+			if (isPaused) {
+				queuedMessages = [...queuedMessages, { ...message, text: clean }];
+			} else {
+				messages = [...messages.slice(-199), { ...message, text: clean }];
+				if (isScrolledToBottom()) {
+					scrollToBottom();
+				}
+			}
 		});
 
 		socket.on('error', (error: { message: string }) => {
@@ -135,7 +175,8 @@
 			return;
 		}
 
-		socket.emit('message', messageInput);
+		const out = sanitizeMessage(messageInput);
+		socket.emit('message', out);
 		messageInput = '';
 
 		messageRateLimit.cooldown = true;
@@ -144,6 +185,17 @@
 		setTimeout(() => {
 			messageRateLimit.cooldown = false;
 		}, MESSAGE_COOLDOWN);
+	}
+
+	function toggleStreaming() {
+		isPaused = !isPaused;
+		if (!isPaused && queuedMessages.length > 0) {
+			messages = [...messages, ...queuedMessages];
+			queuedMessages = [];
+			if (isScrolledToBottom()) {
+				scrollToBottom();
+			}
+		}
 	}
 
 	function formatTime(date: string) {
@@ -157,12 +209,6 @@
 		name: 'Twoblade Chat',
 		description: 'Global chat room for IQ-based discussions'
 	};
-
-	$effect(() => {
-		if (messages.length && messagesDiv) {
-			messagesDiv.scrollIntoView({ behavior: 'smooth', block: 'end' });
-		}
-	});
 
 	$effect(() => {
 		if (messages.length && messagesContainer && !initialScrollDone) {
@@ -181,9 +227,13 @@
 	<ScrollArea class="flex-1">
 		<div class="flex flex-col p-4" bind:this={messagesContainer}>
 			<div bind:this={messagesDiv}>
-				{#each messages as message}
+				{#each messages as message (message.id)}
+					{@const isUserMentioned = checkUserMention(message.text, userMentionString)}
 					<div
-						class="animate-message-appear hover:bg-muted/50 group mb-2 flex max-w-full items-start gap-3 rounded-lg p-2 transition-colors"
+						class={cn(
+							'animate-message-appear group mb-2 flex max-w-full items-start gap-3 rounded-lg p-2 transition-colors',
+							isUserMentioned ? 'bg-yellow-500/30 hover:bg-yellow-600/30' : 'hover:bg-muted/50'
+						)}
 					>
 						<div
 							class={cn(
@@ -206,7 +256,7 @@
 										{formatTime(message.timestamp)}
 									</span>
 								</div>
-								<p class="overflow-wrap-anywhere overflow-hidden break-words text-sm">
+								<p class="overflow-wrap-anywhere overflow-hidden break-words break-all text-sm">
 									{message.text}
 								</p>
 							</div>
@@ -241,6 +291,13 @@
 					(e.preventDefault(), handleSendMessage())}
 				disabled={isBanned}
 			/>
+			<Button variant="secondary" size="icon" onclick={toggleStreaming} class="px-3">
+				{#if isPaused}
+					<PlayCircle class="h-4 w-4" />
+				{:else}
+					<PauseCircle class="h-4 w-4" />
+				{/if}
+			</Button>
 			<Button
 				variant="default"
 				onclick={handleSendMessage}
@@ -298,7 +355,6 @@
 
 	.overflow-wrap-anywhere {
 		overflow-wrap: anywhere;
-		word-break: break-word;
 		min-width: 0;
 	}
 </style>

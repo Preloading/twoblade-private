@@ -4,35 +4,82 @@ import postgres from 'postgres';
 import { config } from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import Redis from 'ioredis';
 import { checkHardcore } from './moderation.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 config({ path: join(__dirname, '../../website/.env') });
 
+const REDIS_URL = process.env.REDIS_URL;
+if (!REDIS_URL) {
+    console.error("REDIS_URL is not defined in environment variables.");
+    process.exit(1);
+}
+const redis = new Redis(REDIS_URL);
+
+redis.on('error', (err) => console.error('Redis Client Error', err));
+redis.on('connect', () => console.log('Connected to Redis'));
+
 function checkVocabulary(text: string, iq: number): { isValid: boolean; limit: number | null } {
-    let maxWordLength: number;
+    // let maxWordLength: number;
 
-    if (iq < 90) maxWordLength = 3;
-    else if (iq < 100) maxWordLength = 4;
-    else if (iq < 120) maxWordLength = 5;
-    else if (iq < 130) maxWordLength = 6;
-    else if (iq < 140) maxWordLength = 7;
-    else return { isValid: true, limit: null };
+    // if (iq < 90) maxWordLength = 3;
+    // else if (iq < 100) maxWordLength = 4;
+    // else if (iq < 120) maxWordLength = 5;
+    // else if (iq < 130) maxWordLength = 6;
+    // else if (iq < 140) maxWordLength = 7;
+    // else return { isValid: true, limit: null };
 
-    const words = text.split(/\s+/);
-    for (const word of words) {
-        const cleanedWord = word.replace(/[.,!?;:"']/g, '');
-        if (cleanedWord.length > maxWordLength) {
-            return { isValid: false, limit: maxWordLength };
-        }
-    }
-    return { isValid: true, limit: maxWordLength };
+    // const words = text.split(/\s+/);
+    // for (const word of words) {
+    //     const cleanedWord = word.replace(/[.,!?;:"']/g, '');
+    //     if (cleanedWord.length > maxWordLength) {
+    //         return { isValid: false, limit: maxWordLength };
+    //     }
+    // }
+    // return { isValid: true, limit: maxWordLength };
+    return { isValid: true, limit: null };
 }
 
 const RATE_LIMIT = {
     messages: 3,
     window: 2000
 };
+
+const SIMILARITY_THRESHOLD = 0.8;
+const RECENT_MESSAGES_TO_KEEP = 5;
+const REDIS_KEY_BANNED_USERS = 'banned_users_set';
+const REDIS_USER_TIMESTAMPS_PREFIX = 'user_timestamps_zset:';
+const REDIS_USER_RECENT_MSGS_PREFIX = 'user_recent_msgs:';
+const REDIS_DEFAULT_TTL_SECONDS = {
+    rateLimit: Math.ceil(RATE_LIMIT.window / 1000) + 60,
+    recentMessages: 5 * 60
+};
+
+function levenshteinDistance(a: string, b: string): number {
+    const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
+
+    for (let i = 0; i <= a.length; i++) matrix[0][i] = i;
+    for (let j = 0; j <= b.length; j++) matrix[j][0] = j;
+
+    for (let j = 1; j <= b.length; j++) {
+        for (let i = 1; i <= a.length; i++) {
+            const substitute = matrix[j - 1][i - 1] + (a[i - 1] !== b[j - 1] ? 1 : 0);
+            matrix[j][i] = Math.min(
+                matrix[j - 1][i] + 1,
+                matrix[j][i - 1] + 1,
+                substitute
+            );
+        }
+    }
+    return matrix[b.length][a.length];
+}
+
+function similarity(a: string, b: string): number {
+    const distance = levenshteinDistance(a.toLowerCase(), b.toLowerCase());
+    const maxLength = Math.max(a.length, b.length);
+    return 1 - distance / maxLength;
+}
 
 interface User {
     id: number;
@@ -64,13 +111,12 @@ const messages: Array<{
     timestamp: string;
 }> = [];
 
-const bannedUserIds = new Set<number>();
-
 const io = new Server({
     cors: {
         origin: [`https://${process.env.PUBLIC_DOMAIN}`, "http://localhost:5173"],
         credentials: true
-    }
+    },
+    transports: ['websocket']
 });
 
 io.use(async (socket, next) => {
@@ -101,18 +147,21 @@ io.use(async (socket, next) => {
             return next(new Error('User not found'));
         }
 
-        if (user.is_banned) {
-            bannedUserIds.add(user.id);
+        const isBannedInDb = user.is_banned;
+        const isBannedInRedis = await redis.sismember(
+            REDIS_KEY_BANNED_USERS,
+            user.id.toString()
+        );
+
+        if (isBannedInDb || isBannedInRedis) {
+            if (isBannedInDb && !isBannedInRedis) {
+                await redis.sadd(REDIS_KEY_BANNED_USERS, user.id.toString());
+            }
             await sql`
                  DELETE FROM user_secret_codes 
                  WHERE code = ${payload.code as string}
              `;
             return next(new Error('User is banned'));
-        } else {
-            if (bannedUserIds.has(user.id)) {
-                console.log(`User ${user.id} is no longer banned, removing from bannedUserIds set.`);
-                bannedUserIds.delete(user.id);
-            }
         }
 
         socket.data.user = user;
@@ -123,7 +172,6 @@ io.use(async (socket, next) => {
     }
 });
 
-const userMessageTimestamps: Map<number, number[]> = new Map();
 let connectedUsers = new Set();
 
 io.on('connection', (socket) => {
@@ -136,14 +184,25 @@ io.on('connection', (socket) => {
 
     socket.emit('recent_messages', messages.slice(-200));
 
-    socket.on('message', async (text: string) => {
-        if (bannedUserIds.has(user.id)) {
-            socket.emit('error', { message: 'You are banned from sending messages.' });
+    socket.on('message', async (text_: unknown) => {
+        const isUserBanned = await redis.sismember(
+            REDIS_KEY_BANNED_USERS,
+            user.id.toString()
+        );
+        if (isUserBanned) {
+            socket.emit('error', {
+                message: 'You are banned from sending messages.'
+            });
             socket.disconnect(true);
             return;
         }
 
-        text = text.trim().slice(0, 500);
+        if (typeof text_ !== 'string') {
+            socket.emit('error', { message: 'Invalid message format' });
+            return;
+        }
+
+        const text = text_.trim().slice(0, 500);
         if (!text) return;
 
         if (checkHardcore(text)) {
@@ -153,19 +212,49 @@ io.on('connection', (socket) => {
             return;
         }
 
+        const redisKeyUserTimestamps = `${REDIS_USER_TIMESTAMPS_PREFIX}${user.id}`;
         const now = Date.now();
-        const userTimestamps = userMessageTimestamps.get(user.id) || [];
-        const recentMessages = userTimestamps.filter(ts => now - ts < RATE_LIMIT.window);
+        const windowStart = now - RATE_LIMIT.window;
 
-        if (recentMessages.length >= RATE_LIMIT.messages) {
+        await redis.zremrangebyscore(
+            redisKeyUserTimestamps,
+            '-inf',
+            `(${windowStart}`
+        );
+        const countInWindow = await redis.zcard(redisKeyUserTimestamps);
+
+        await redis.expire(
+            redisKeyUserTimestamps,
+            REDIS_DEFAULT_TTL_SECONDS.rateLimit
+        );
+
+        if (countInWindow >= RATE_LIMIT.messages) {
             socket.emit('error', {
                 message: `You're sending messages too quickly. Please wait ${RATE_LIMIT.window / 1000} seconds.`
             });
             return;
         }
 
-        userTimestamps.push(now);
-        userMessageTimestamps.set(user.id, userTimestamps);
+        await redis.zadd(
+            redisKeyUserTimestamps,
+            now.toString(),
+            now.toString()
+        );
+
+        const redisKeyUserRecentMessages = `${REDIS_USER_RECENT_MSGS_PREFIX}${user.id}`;
+        // const recentMessagesFromRedis = await redis.lrange(
+        //     redisKeyUserRecentMessages,
+        //     0,
+        //     -1
+        // );
+        // for (const prevMessage of recentMessagesFromRedis) {
+        //     if (similarity(text, prevMessage) > SIMILARITY_THRESHOLD) {
+        //         socket.emit('error', {
+        //             message: 'Your message is too similar to a recent message you sent.'
+        //         });
+        //         return;
+        //     }
+        // }
 
         const { isValid, limit } = checkVocabulary(text, user.iq);
         if (!isValid) {
@@ -174,6 +263,19 @@ io.on('connection', (socket) => {
             });
             return;
         }
+
+        await redis.rpush(redisKeyUserRecentMessages, text);
+        await redis.ltrim(
+            redisKeyUserRecentMessages,
+            -RECENT_MESSAGES_TO_KEEP,
+            -1
+        );
+        await redis.expire(
+            redisKeyUserRecentMessages,
+            REDIS_DEFAULT_TTL_SECONDS.recentMessages
+        );
+
+
 
         const message = {
             id: crypto.randomUUID(),
@@ -210,7 +312,11 @@ io.on('connection', (socket) => {
 
         const userToBanId = usersToBan[0].id;
 
-        bannedUserIds.add(userToBanId);
+        await redis.sadd(REDIS_KEY_BANNED_USERS, userToBanId.toString());
+
+        const redisKeyUserTimestamps = `${REDIS_USER_TIMESTAMPS_PREFIX}${userToBanId}`;
+        const redisKeyUserRecentMessages = `${REDIS_USER_RECENT_MSGS_PREFIX}${userToBanId}`;
+        await redis.del(redisKeyUserTimestamps, redisKeyUserRecentMessages);
 
         await sql`
             UPDATE users 
@@ -237,7 +343,6 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        userMessageTimestamps.delete(user.id);
         connectedUsers.delete(user.id);
         io.emit('users_count', connectedUsers.size);
         console.log(`User disconnected: ${user.username}#${user.domain}`);

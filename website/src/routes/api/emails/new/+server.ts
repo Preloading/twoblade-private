@@ -14,16 +14,6 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
             }, { status: 401 });
         }
 
-        const statusUrl = `https://${PUBLIC_DOMAIN}/sharp/api/server/health`;
-        const statusResponse = await fetch(statusUrl);
-
-        if (!statusResponse.ok) {
-            return json({
-                status: 'error',
-                message: 'Server is not available'
-            }, { status: 503 });
-        }
-
         const emailData = await request.json();
         const { turnstileToken, ...restData } = emailData;
 

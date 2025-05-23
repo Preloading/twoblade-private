@@ -5,13 +5,21 @@ import { sql } from '$lib/server/db';
 import { PUBLIC_DOMAIN } from '$env/static/public';
 import { getSessionScore, deleteSession_ } from '$lib/server/iq';
 import { validateUsername } from '$lib/utils';
+import { checkHardcore } from '../../../../websocket/src/moderation';
 
 const SALT_ROUNDS = 10;
 
 export const actions: Actions = {
-    default: async ({ request }) => {
+    default: async ({ request, getClientAddress }) => {
         try {
             const data = await request.formData();
+            const ip =
+                request.headers.get('cf-connecting-ip') ??
+                request.headers.get('x-real-ip') ??
+                request.headers.get('x-forwarded-for')?.split(',')[0] ??
+                getClientAddress();
+            const userAgent = request.headers.get('user-agent') || '';
+
             const username = data.get('username')?.toString()?.toLowerCase();
             const password = data.get('password')?.toString();
             const confirmPassword = data.get('confirmPassword')?.toString();
@@ -31,9 +39,14 @@ export const actions: Actions = {
             });
 
             if (!username) return fail(400, { error: 'Username is required' });
+
             if (!validateUsername(username)) {
                 return fail(400, { error: 'Invalid username format', username });
             }
+            if (checkHardcore(username)) {
+                return fail(400, { error: 'Username contains inappropriate content' });
+            }
+
             if (!password) return fail(400, { error: 'Password is required', username });
             if (!confirmPassword) return fail(400, { error: 'Password confirmation is required', username });
             if (!inviteKey) return fail(400, { error: 'An invite key is required.', username });
@@ -85,8 +98,8 @@ export const actions: Actions = {
 
             const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
             await sql`
-                INSERT INTO users (username, password_hash, domain, iq)
-                VALUES (${username}, ${passwordHash}, ${PUBLIC_DOMAIN}, ${serverIqScore})
+                INSERT INTO users (username, password_hash, domain, iq, ip, user_agent)
+                VALUES (${username}, ${passwordHash}, ${PUBLIC_DOMAIN}, ${serverIqScore}, ${ip}, ${userAgent})
             `;
 
             await deleteSession_(sessionId);

@@ -9,8 +9,13 @@ import { createHash } from 'crypto'
 const SHARP_PORT = +process.env.SHARP_PORT || 5000
 const HTTP_PORT = +process.env.HTTP_PORT || SHARP_PORT + 1
 const DOMAIN = process.env.DOMAIN_NAME || 'localhost'
+
+const USERNAME_REGEX = /^[a-zA-Z0-9_\-!$%&'*/?=^@.]+$/;
+const MAX_USERNAME_LENGTH = 20;
+
 const sql = postgres(process.env.DATABASE_URL)
 
+// Cleanup for pending emails
 setInterval(async () => {
     try {
         await sql`
@@ -25,31 +30,55 @@ setInterval(async () => {
     }
 }, 10000);
 
+// Cleanup for expired emails
 setInterval(async () => {
     try {
-        // First, clean up attachments for expired emails
-        await sql`
-            DELETE FROM attachments
-            WHERE email_id IN (
-                SELECT id FROM emails
-                WHERE expires_at < NOW()
-                AND expires_at IS NOT NULL
-            )
-        `;
-        // TODO: remove from S3 too
-
-        // Then delete the expired emails
-        await sql`
-            DELETE FROM emails
+        const toDelete = await sql`
+        WITH RECURSIVE to_delete AS (
+            SELECT id
+            FROM emails
             WHERE expires_at < NOW()
-            AND expires_at IS NOT NULL
+                AND expires_at IS NOT NULL
+            UNION ALL
+            SELECT e.id
+            FROM emails e
+            JOIN to_delete td ON e.reply_to_id = td.id
+        )
+        SELECT id FROM to_delete
         `;
+
+        if (toDelete.length > 0) {
+            const ids = toDelete.map(r => r.id);
+            await sql`
+                DELETE FROM attachments
+                WHERE email_id = ANY(${ids})
+            `;
+            await sql`
+                DELETE FROM emails
+                WHERE id = ANY(${ids})
+            `;
+        }
     } catch (error) {
         console.error('Error cleaning up expired emails:', error);
     }
 }, 10000);
 
-const PROTOCOL_VERSION = 'SHARP/1.2'
+// Cleanup for used hashcash tokens
+setInterval(async () => {
+    try {
+        const result = await sql`
+            DELETE FROM used_hashcash_tokens
+            WHERE expires_at < NOW()
+        `;
+        if (result.count > 0) {
+            console.log(`Cleaned up ${result.count} expired hashcash tokens.`);
+        }
+    } catch (error) {
+        console.error('Error cleaning up used hashcash tokens:', error);
+    }
+}, 3600000); // Run every hour
+
+const PROTOCOL_VERSION = 'SHARP/1.3'
 
 const KEYWORDS = {
     promotions: new Set([
@@ -73,7 +102,8 @@ const KEYWORDS = {
 const HASHCASH_THRESHOLDS = {
     GOOD: 18,
     WEAK: 10,
-    TRIVIAL: 5
+    TRIVIAL: 5,
+    REJECT: 3
 };
 
 const verifyUser = (u, d) =>
@@ -103,15 +133,25 @@ const parseSharpAddress = a => {
 };
 
 const sendJSON = (s, m) => s.writable && s.write(JSON.stringify(m) + '\n')
-const sendError = (s, e) => {
-    sendJSON(s, { type: 'ERROR', message: e })
+const sendError = (s, e, code = 400) => {
+    sendJSON(s, { type: 'ERROR', message: e, code })
     s.end()
+}
+
+function isValidSharpUsername(username) {
+    if (!username || username.length === 0 || username.length > MAX_USERNAME_LENGTH) {
+        return false;
+    }
+    if (!USERNAME_REGEX.test(username)) {
+        return false;
+    }
+    return true;
 }
 
 async function handleSharpMessage(socket, raw, state) {
     const MAX_MESSAGE_SIZE = 1 * 1024 * 1024;
     if (raw.length > MAX_MESSAGE_SIZE) {
-        sendError(socket, 'Message too large');
+        sendError(socket, 'Message too large', 413);
         return;
     }
 
@@ -130,6 +170,10 @@ async function handleSharpMessage(socket, raw, state) {
 
                 try {
                     const parsedFrom = parseSharpAddress(cmd.server_id);
+                    if (!isValidSharpUsername(parsedFrom.username)) {
+                        sendError(socket, `Invalid username format in server_id.`);
+                        return;
+                    }
                     await verifySharpDomain(parsedFrom.domain, socket.remoteAddress);
                     state.from = cmd.server_id;
                     state.step = 'MAIL_TO';
@@ -145,22 +189,44 @@ async function handleSharpMessage(socket, raw, state) {
                     return
                 }
                 state.to = cmd.address
-                const to = parseSharpAddress(state.to)
+                let to;
+                try {
+                    to = parseSharpAddress(state.to);
+                } catch (e) {
+                    sendError(socket, `Invalid recipient address format: ${e.message}`);
+                    return;
+                }
+
+                if (!isValidSharpUsername(to.username)) {
+                    sendError(socket, `Invalid username format in recipient address.`);
+                    return;
+                }
+
                 const addr = to.port
                     ? `${to.domain}:${to.port}`
                     : to.domain
                 if (addr !== DOMAIN) {
-                    sendError(
-                        socket,
-                        `This server does not handle mail for ${to.domain}`
-                    )
+                    sendError(socket, `This server does not handle mail for ${to.domain}`, 451)
                     return
                 }
                 const user = await verifyUser(to.username, DOMAIN)
                 if (!user) {
-                    sendError(socket, 'Recipient user not found')
+                    sendError(socket, 'Recipient user not found', 550)
                     return
                 }
+
+                // Inter-server hashcash check
+                if (!cmd.hashcash) {
+                    sendError(socket, 'Missing X-Hashcash header or hashcash field', 429);
+                    return;
+                }
+                const spamScore = await calculateSpamScore(cmd.hashcash, state.to);
+                if (spamScore >= HASHCASH_THRESHOLDS.REJECT) {
+                    sendError(socket, `Insufficient proof of work. Score: ${spamScore}`, 429);
+                    return;
+                }
+                state.hashcash = cmd.hashcash;
+
                 state.step = 'DATA'
                 sendJSON(socket, { type: 'OK' })
                 return
@@ -181,6 +247,8 @@ async function handleSharpMessage(socket, raw, state) {
                     state.content_type = cmd.content_type || 'text/plain';
                     state.html_body = cmd.html_body || null;
                     state.attachments = cmd.attachments || [];
+
+                    sendJSON(socket, { type: 'OK', message: 'Email content received' });
                 } else if (cmd.type === 'END_DATA') {
                     await processEmail(state);
                     sendJSON(socket, { type: 'OK', message: 'Email processed' });
@@ -198,18 +266,29 @@ async function handleSharpMessage(socket, raw, state) {
     }
 }
 
-async function processEmail({ from, to, subject, body, content_type, html_body, attachments = [] }) {
+async function processEmail({ from, to, subject, body, content_type, html_body, attachments = [], hashcash }) {
     const f = parseSharpAddress(from)
     const t = parseSharpAddress(to)
     const emailResult = await logEmail(from, f.domain, to, t.domain, subject, body, content_type, html_body, 'sent')
+    const emailId = emailResult[0]?.id;
 
-    if (attachments.length > 0) {
+    if (emailId && hashcash) {
+        try {
+            const hashcashDate = parseHashcashDate(hashcash.split(':')[2]);
+            const tokenExpiry = new Date(hashcashDate.getTime() + 24 * 60 * 60 * 1000);
+            await sql`INSERT INTO used_hashcash_tokens (token, expires_at) VALUES (${hashcash}, ${tokenExpiry}) ON CONFLICT (token) DO NOTHING`;
+        } catch (e) {
+            console.error(`Failed to log used hashcash token ${hashcash} for SHARP email ${emailId}:`, e);
+        }
+    }
+
+    if (emailId && attachments.length > 0) {
         await sql`
             UPDATE attachments 
-            SET email_id = ${emailResult[0].id},
+            SET email_id = ${emailId},
                 status = 'sent'
             WHERE key = ANY(${attachments})
-        `
+        `;
     }
 }
 
@@ -249,48 +328,15 @@ function classifyEmail(subject, body, htmlBody) {
     return 'primary';
 }
 
-async function validateRemoteServer(healthCheckHost, expectedDomain, httpPort) {
-    const timeout = 5000;
-    const healthPort = httpPort || HTTP_PORT;
-
-    for (const proto of ['https://', 'http://']) {
-        try {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), timeout);
-
-            const url = `${proto}${healthCheckHost}:${healthPort}/sharp/api/server/health`;
-            const res = await fetch(url, { signal: controller.signal });
-            clearTimeout(timer);
-
-            if (!res.ok) continue;
-            const data = await res.json();
-
-            if (data.protocol === PROTOCOL_VERSION && data.domain === expectedDomain) {
-                return { domain: data.domain, protocol: proto, isValid: true };
-            }
-        } catch { }
-    }
-    return { isValid: false, error: 'Server not reachable or invalid' };
-}
-
 async function sendEmailToRemoteServer(emailData) {
     const recAddr = parseSharpAddress(emailData.to);
-    let target, domain, httpPort;
+    let target;
 
     if (recAddr.port) {
         target = { host: recAddr.domain, port: recAddr.port };
-        domain = recAddr.domain;
-        httpPort = recAddr.port + 1;
     } else {
         const srv = await resolveSrv(recAddr.domain);
         target = { host: srv.ip, port: srv.port };
-        domain = recAddr.domain;
-        httpPort = srv.httpPort;
-    }
-
-    const validation = await validateRemoteServer(domain, recAddr.domain, httpPort);
-    if (!validation.isValid) {
-        throw new Error(`Remote server validation failed for ${domain}: ${validation.error}`);
     }
 
     console.log(`[sendEmailToRemoteServer] dialing TCP ${target.host}:${target.port}`);
@@ -302,7 +348,7 @@ async function sendEmailToRemoteServer(emailData) {
 
     const steps = [
         { type: 'HELLO', server_id: emailData.from, protocol: PROTOCOL_VERSION },
-        { type: 'MAIL_TO', address: emailData.to },
+        { type: 'MAIL_TO', address: emailData.to, hashcash: emailData.hashcash },
         { type: 'DATA' },
         {
             type: 'EMAIL_CONTENT',
@@ -336,8 +382,6 @@ async function sendEmailToRemoteServer(emailData) {
                 return reject(new Error('Invalid JSON from remote'));
             }
 
-            responses.push(response);
-
             if (response.type === 'ERROR') {
                 cleanup();
                 return reject(new Error(response.message));
@@ -348,6 +392,11 @@ async function sendEmailToRemoteServer(emailData) {
                     cleanup();
                     return resolve({ success: true, responses });
                 }
+
+                if (response.message === 'Email content received') {
+                    return;
+                }
+
                 sendNextMessage();
             }
         };
@@ -361,6 +410,11 @@ async function sendEmailToRemoteServer(emailData) {
             if (stepIndex < steps.length) {
                 const message = steps[stepIndex++];
                 sendMessage(message);
+
+                if (message.type === 'EMAIL_CONTENT' && steps[stepIndex]?.type === 'END_DATA') {
+                    sendMessage(steps[stepIndex]);
+                    stepIndex++;
+                }
             } else {
                 cleanup();
                 reject(new Error('Unexpected state: No more messages to send.'));
@@ -435,13 +489,13 @@ async function processScheduledEmails() {
                     body: email.body,
                     content_type: email.content_type,
                     html_body: email.html_body,
-                    attachments: email.attachments || []
+                    attachments: email.attachments || [],
+                    // placeholder.
+                    // scheduled emails are not sent with hashcash
+                    // they are already sent as "spam" instantly, without scheduling, if weak hashcash
+                    // hashcash: hashcash(email.to_address)
                 });
-                await sql`
-            UPDATE emails
-            SET status = 'sent'
-            WHERE id = ${email.id}
-          `;
+                await sql`UPDATE emails SET status = 'sent' WHERE id = ${email.id}`;
                 console.log(
                     `Successfully sent scheduled email ID ${email.id}`
                 );
@@ -477,7 +531,7 @@ function parseHashcashDate(dateString) {
     const minute = parseInt(dateString.substring(8, 10), 10);
     const second = parseInt(dateString.substring(10, 12), 10);
 
-    return new Date(year, month, day, hour, minute, second);
+    return new Date(Date.UTC(year, month, day, hour, minute, second));
 }
 
 function hasLeadingZeroBits(hexHash, bits) {
@@ -491,26 +545,36 @@ function hasLeadingZeroBits(hexHash, bits) {
     return (hashInt >> shiftAmount) === 0n;
 }
 
-function calculateSpamScore(header, resource) {
-    if (!header) return 3;
+async function calculateSpamScore(header, resource) {
+    if (!header) return HASHCASH_THRESHOLDS.REJECT;
 
     try {
         const [version, bits, date, headerResource, ext, rand, counter] = header.split(':');
 
         if (version !== '1' || !bits || !date || !headerResource || !rand || !counter) {
-            return 3;
+            return HASHCASH_THRESHOLDS.REJECT;
         }
 
         // Verify resource matches
         if (headerResource !== resource) {
-            return 3;
+            return HASHCASH_THRESHOLDS.REJECT;
         }
 
-        // Verify date is within last hour
         const headerDate = parseHashcashDate(date);
         const now = new Date();
+        const offset = 2 * 60 * 1000;
+
+        if (headerDate > new Date(now.getTime() + offset)) {
+            return HASHCASH_THRESHOLDS.REJECT;
+        }
+
         if (now - headerDate > 3600000) {
-            return 2;
+            return HASHCASH_THRESHOLDS.WEAK + 1;
+        }
+
+        const existingToken = await sql`SELECT 1 FROM used_hashcash_tokens WHERE token = ${header}`;
+        if (existingToken.length > 0) {
+            return HASHCASH_THRESHOLDS.REJECT;
         }
 
         // Verify proof of work
@@ -521,15 +585,15 @@ function calculateSpamScore(header, resource) {
         const actualBits = parseInt(bits, 10);
 
         if (!hasLeadingZeroBits(hash, actualBits)) {
-            return 3;
+            return HASHCASH_THRESHOLDS.REJECT;
         }
 
         if (actualBits >= HASHCASH_THRESHOLDS.GOOD) return 0;
         if (actualBits >= HASHCASH_THRESHOLDS.WEAK) return 1;
         if (actualBits >= HASHCASH_THRESHOLDS.TRIVIAL) return 2;
-        return 3;
+        return HASHCASH_THRESHOLDS.REJECT;
     } catch {
-        return 3;
+        return HASHCASH_THRESHOLDS.REJECT;
     }
 }
 
@@ -555,34 +619,49 @@ function checkVocabulary(text, iq) {
 
 app.post('/send', validateAuthToken, async (req, res) => {
     let logEntry;
-    let id;
+    let emailId;
     try {
-        const { hashcash, turnstileToken, ...emailData } = req.body;
+        const { hashcash, ...emailData } = req.body;
 
-        const spamScore = calculateSpamScore(hashcash, emailData.to);
-        let status = 'pending';
-
-        if (!hashcash || spamScore >= 3) {
-            return res.status(429).json({
+        let fp, tp;
+        try {
+            fp = parseSharpAddress(emailData.from);
+            tp = parseSharpAddress(emailData.to);
+        } catch {
+            return res.status(400).json({
                 success: false,
-                message: `Insufficient proof of work. Please retry with at least ${HASHCASH_THRESHOLDS.TRIVIAL} bits.`
+                message: 'Invalid SHARP address format'
             });
         }
 
-        // if email is spam, scheduled instantly goes to spam tab
-        if (spamScore > 0 || !req.turnstileVerified) {
+        if (!req.turnstileVerified) {
+            return res.status(403).json({
+                success: false,
+                message: 'Turnstile verification failed. Please try again.'
+            });
+        }
+
+        const spamScore = await calculateSpamScore(hashcash, emailData.to);
+        let status = 'pending';
+
+        if (!hashcash || spamScore >= HASHCASH_THRESHOLDS.REJECT) {
+            return res.status(429).json({
+                success: false,
+                message: `Insufficient proof of work or invalid/reused token. Required: ${HASHCASH_THRESHOLDS.TRIVIAL} bits. Score: ${spamScore}.`
+            });
+        }
+
+        if (spamScore > 0) {
             status = 'spam';
         }
 
-        if (emailData.scheduled_at) {
+        if (emailData.scheduled_at && status !== 'spam') {
             status = 'scheduled';
         }
 
         const { from, to, subject, body, content_type = 'text/plain',
             html_body, scheduled_at, reply_to_id, thread_id,
             attachments = [], expires_at = null, self_destruct = false } = emailData;
-
-        const fp = parseSharpAddress(from);
 
         if (fp.username !== req.user.username || fp.domain !== req.user.domain) {
             return res.status(403).json({
@@ -610,18 +689,27 @@ app.post('/send', validateAuthToken, async (req, res) => {
             }
         }
 
-        if (emailData.scheduled_at) status = 'scheduled';
+        if (hashcash && spamScore < HASHCASH_THRESHOLDS.REJECT) {
+            try {
+                const hashcashDate = parseHashcashDate(hashcash.split(':')[2]);
+
+                const tokenExpiry = new Date(hashcashDate.getTime() + 24 * 60 * 60 * 1000);
+                await sql`INSERT INTO used_hashcash_tokens (token, expires_at) VALUES (${hashcash}, ${tokenExpiry}) ON CONFLICT (token) DO NOTHING`;
+            } catch (e) {
+                console.error(`Failed to log used hashcash token ${hashcash} for /send:`, e);
+                // proceed with email sending
+            }
+        }
 
         const attachmentKeys = attachments.map(att => att.key).filter(Boolean);
-        const tp = parseSharpAddress(to);
 
-        if (scheduled_at) {
+        if (scheduled_at && status === 'scheduled') {
             logEntry = await logEmail(from, fp.domain, to, tp.domain, subject, body, content_type, html_body, status, scheduled_at, reply_to_id, thread_id, expires_at, self_destruct);
-            id = logEntry[0]?.id;
-            if (id && attachmentKeys.length > 0) {
-                await sql`UPDATE attachments SET email_id = ${id}, status = ${status} WHERE key = ANY(${attachmentKeys})`;
+            emailId = logEntry[0]?.id;
+            if (emailId && attachmentKeys.length > 0) {
+                await sql`UPDATE attachments SET email_id = ${emailId}, status = ${status} WHERE key = ANY(${attachmentKeys})`;
             }
-            return res.json({ success: true, scheduled: true, id });
+            return res.json({ success: true, scheduled: true, id: emailId });
         }
 
         if (tp.domain === DOMAIN) {
@@ -630,18 +718,11 @@ app.post('/send', validateAuthToken, async (req, res) => {
             }
             const finalStatus = status === 'pending' ? 'sent' : status;
             logEntry = await logEmail(from, fp.domain, to, tp.domain, subject, body, content_type, html_body, finalStatus, null, reply_to_id, thread_id, expires_at, self_destruct);
-            id = logEntry[0]?.id;
-            if (id && attachmentKeys.length > 0) {
-                await sql`UPDATE attachments SET email_id = ${id}, status = ${finalStatus} WHERE key = ANY(${attachmentKeys})`;
+            emailId = logEntry[0]?.id;
+            if (emailId && attachmentKeys.length > 0) {
+                await sql`UPDATE attachments SET email_id = ${emailId}, status = ${finalStatus} WHERE key = ANY(${attachmentKeys})`;
             }
-            return res.json({ success: true, id });
-        }
-
-        try {
-            await validateRemoteServer(tp.domain, tp.domain);
-        } catch (e) {
-            await logEmail(from, fp.domain, to, tp.domain, subject, body, content_type, html_body, 'failed', null, reply_to_id, thread_id, expires_at, self_destruct);
-            throw new Error(`Invalid destination: ${e.message}`);
+            return res.json({ success: true, id: emailId });
         }
 
         logEntry = await logEmail(
@@ -649,24 +730,36 @@ app.post('/send', validateAuthToken, async (req, res) => {
             content_type, html_body, status, scheduled_at,
             reply_to_id, thread_id, expires_at, self_destruct
         );
-        id = logEntry[0]?.id;
+        emailId = logEntry[0]?.id;
 
-        if (id && attachmentKeys.length > 0) {
-            console.log(`[Remote] Linking ${attachmentKeys.length} attachments to email ID ${id}:`, attachmentKeys);
+        if (emailId && attachmentKeys.length > 0) {
+            console.log(`[Remote] Linking ${attachmentKeys.length} attachments to email ID ${emailId}:`, attachmentKeys);
             await sql`
                 UPDATE attachments
-                SET email_id = ${id},
-                    status = 'sending' // Attachments are 'sending' during remote transfer attempt
+                SET email_id = ${emailId},
+                    status = 'sending' 
                 WHERE key = ANY(${attachmentKeys})
             `;
         }
 
-        // Proceed with sending (status could be 'pending' or 'spam')
+        // don't attempt remote delivery, just store as spam
+        if (status === 'spam') {
+            if (emailId) {
+                await sql`UPDATE emails SET status='spam' WHERE id=${emailId}`;
+                if (attachmentKeys.length > 0) {
+                    await sql`UPDATE attachments SET status='spam' WHERE email_id = ${emailId}`;
+                }
+            }
+            return res.json({ success: true, id: emailId, message: "Email marked as spam due to low PoW or Turnstile policy." });
+        }
+
+
         try {
             const result = await Promise.race([
                 sendEmailToRemoteServer({
                     from, to, subject, body, content_type, html_body,
-                    attachments: attachmentKeys
+                    attachments: attachmentKeys,
+                    hashcash: hashcash
                 }),
                 new Promise((_, r) => setTimeout(() => {
                     r(new Error('Connection timed out'))
@@ -674,8 +767,8 @@ app.post('/send', validateAuthToken, async (req, res) => {
             ])
 
             if (result.responses?.some(r => r.type === 'ERROR')) {
-                if (id) {
-                    await sql`UPDATE emails SET status='rejected' WHERE id=${id}`;
+                if (emailId) {
+                    await sql`UPDATE emails SET status='rejected', error_message = ${result.responses.find(r => r.type === 'ERROR')?.message || 'Remote server rejected'} WHERE id=${emailId}`;
                     if (attachmentKeys.length > 0) {
                         await sql`UPDATE attachments SET status='rejected' WHERE key = ANY(${attachmentKeys})`;
                     }
@@ -683,19 +776,19 @@ app.post('/send', validateAuthToken, async (req, res) => {
                 return res.status(400).json({ success: false, message: 'Remote server rejected the email' })
             }
 
-            if (id) {
+            if (emailId) {
                 // Update status to 'sent' only upon successful remote delivery,
                 // even if it was initially marked as 'spam' by the sender.
                 // The recipient server will make its own final determination.
-                await sql`UPDATE emails SET status='sent', sent_at = NOW() WHERE id=${id}`;
+                await sql`UPDATE emails SET status='sent', sent_at = NOW() WHERE id=${emailId}`;
                 if (attachmentKeys.length > 0) {
                     await sql`UPDATE attachments SET status='sent' WHERE key = ANY(${attachmentKeys})`;
                 }
             }
-            return res.json({ ...result, id });
+            return res.json({ ...result, id: emailId });
         } catch (e) {
-            if (id) {
-                await sql`UPDATE emails SET status='failed', error_message=${e.message} WHERE id=${id}`;
+            if (emailId) {
+                await sql`UPDATE emails SET status='failed', error_message=${e.message} WHERE id=${emailId}`;
                 if (attachmentKeys.length > 0) {
                     await sql`UPDATE attachments SET status='failed' WHERE key = ANY(${attachmentKeys})`;
                 }
@@ -704,11 +797,14 @@ app.post('/send', validateAuthToken, async (req, res) => {
         }
     } catch (e) {
         console.error('Request failed:', e);
-        if (id && !(await sql`SELECT 1 FROM emails WHERE id=${id} AND status IN ('failed', 'rejected', 'spam')`)[0]) {
-            await sql`UPDATE emails SET status='failed', error_message=${e.message} WHERE id=${id}`;
-            const attachmentKeys = req.body.attachments?.map(att => att.key).filter(Boolean) || [];
-            if (attachmentKeys.length > 0) {
-                await sql`UPDATE attachments SET status='failed' WHERE key = ANY(${attachmentKeys}) AND email_id = ${id}`;
+        if (emailId) {
+            const checkStatus = await sql`SELECT status FROM emails WHERE id=${emailId}`;
+            if (checkStatus.length > 0 && !['failed', 'rejected', 'spam'].includes(checkStatus[0].status)) {
+                await sql`UPDATE emails SET status='failed', error_message=${e.message} WHERE id=${emailId}`;
+                const attachmentKeys = req.body.attachments?.map(att => att.key).filter(Boolean) || [];
+                if (attachmentKeys.length > 0) {
+                    await sql`UPDATE attachments SET status='failed' WHERE email_id = ${emailId}`;
+                }
             }
         }
         return res.status(400).json({ success: false, message: e.message })
@@ -731,7 +827,7 @@ net
     .createServer(socket => {
         const MAX_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB total buffer limit
         const remoteAddress = `${socket.remoteAddress}:${socket.remotePort}`;
-        const state = { step: 'HELLO', buffer: '' };
+        const state = { step: 'HELLO', buffer: '', hashcash: null };
 
         socket.on('data', d => {
             if (state.buffer.length + d.length > MAX_BUFFER_SIZE) {
