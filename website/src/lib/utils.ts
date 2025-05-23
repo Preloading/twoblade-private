@@ -118,6 +118,7 @@ export function checkVocabulary(text: string, iq: number): { isValid: boolean; l
     else if (iq < 120) maxWordLength = 5;
     else if (iq < 130) maxWordLength = 6;
     else if (iq < 140) maxWordLength = 7;
+    else if (iq < 150) maxWordLength = 99;
     else return { isValid: true, limit: null };
 
     const words = text.split(/\s+/);
